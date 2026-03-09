@@ -38,6 +38,52 @@ async def process_request(connection, request):
         return connection.respond(HTTPStatus.BAD_REQUEST, "Missing or invalid ?role= (gateway|client)\n")
 
 
+async def forward_complete_json(buffer, source_label, dest_ws, dest_label):
+    while True:
+        try:
+            json.loads(buffer)
+            complete = buffer
+            buffer = ""
+            print(f"[{source_label}] {complete}")
+            if dest_ws is not None:
+                await dest_ws.send(complete)
+                print(f"[{dest_label}] {complete}")
+            return buffer
+        except json.JSONDecodeError:
+            pass
+
+        # buffer might contain multiple concatenated JSON objects
+        # try to find the boundary by tracking brace depth
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(buffer):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    complete = buffer[:i + 1]
+                    buffer = buffer[i + 1:]
+                    print(f"[{source_label}] {complete}")
+                    if dest_ws is not None:
+                        await dest_ws.send(complete)
+                        print(f"[{dest_label}] {complete}")
+                    return buffer
+        return buffer
+
+
 async def handle_connection(ws):
     global gateway_ws, client_ws
 
@@ -50,12 +96,15 @@ async def handle_connection(ws):
             return
         gateway_ws = ws
         print("[relay] Gateway connected")
+        buffer = ""
         try:
             async for message in ws:
-                print(f"[gateway -> relay] {message}")
-                if client_ws is not None:
-                    await client_ws.send(message)
-                    print(f"[relay -> client] {message}")
+                buffer += message if isinstance(message, str) else message.decode()
+                buffer = await forward_complete_json(
+                    buffer, "gateway -> relay", client_ws, "relay -> client"
+                )
+                if buffer:
+                    print(f"[relay] Buffering {len(buffer)} bytes from gateway")
         except websockets.ConnectionClosed:
             pass
         finally:
