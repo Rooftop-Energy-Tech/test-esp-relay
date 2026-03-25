@@ -1,19 +1,118 @@
 import asyncio
 import json
 import os
+import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from http import HTTPStatus
 from urllib.parse import parse_qs, urlparse
 
 import websockets
+from openpyxl import Workbook, load_workbook
 
 PORT = int(os.environ.get("PORT", 8080))
+OUTPUT_DIR = "./output"
 
 gateway_ws = None
 client_ws = None
 
+executor = ThreadPoolExecutor(max_workers=4)
+_file_locks: dict[str, threading.Lock] = {}
+_file_locks_mutex = threading.Lock()
 
-def parse_request(path):
+CONFIG_HEADERS = ["Timestamp", "Event", "BaudRate", "Interval", "SlaveId", "Name", "DeviceBaudRate", "Enabled", "SlaveIdRegister", "Registers"]
+DATA_HEADERS = ["Timestamp", "SlaveId", "Name", "Label", "Value"]
+
+
+def sanitize_name(name: str) -> str:
+    return re.sub(r"[^\w]", "_", name).strip("_")
+
+
+def get_device_filepath(slave_id: int, name: str) -> str:
+    return os.path.join(OUTPUT_DIR, f"device_{slave_id}_{sanitize_name(name)}.xlsx")
+
+
+def _get_file_lock(filepath: str) -> threading.Lock:
+    with _file_locks_mutex:
+        if filepath not in _file_locks:
+            _file_locks[filepath] = threading.Lock()
+        return _file_locks[filepath]
+
+
+def _ensure_workbook(filepath: str) -> Workbook:
+    if os.path.exists(filepath):
+        return load_workbook(filepath)
+    wb = Workbook()
+    ws_config = wb.active
+    ws_config.title = "Config"
+    ws_config.append(CONFIG_HEADERS)
+    ws_data = wb.create_sheet("Data")
+    ws_data.append(DATA_HEADERS)
+    return wb
+
+
+def _write_data_row_sync(filepath: str, slave_id: int, name: str, timestamp: str, label: str, value) -> None:
+    lock = _get_file_lock(filepath)
+    with lock:
+        wb = _ensure_workbook(filepath)
+        wb["Data"].append([timestamp, slave_id, name, label, value])
+        wb.save(filepath)
+
+
+def _write_config_row_sync(filepath: str, timestamp: str, event: str, baud_rate: int, interval: int, device: dict) -> None:
+    lock = _get_file_lock(filepath)
+    with lock:
+        wb = _ensure_workbook(filepath)
+        wb["Config"].append([
+            timestamp,
+            event,
+            baud_rate,
+            interval,
+            device.get("slaveId"),
+            device.get("name"),
+            device.get("baudRate"),
+            device.get("enabled"),
+            device.get("slaveIdRegister"),
+            json.dumps(device.get("registers", [])),
+        ])
+        wb.save(filepath)
+
+
+async def log_data_message(payload: dict) -> None:
+    loop = asyncio.get_event_loop()
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    for device in payload.get("devices", []):
+        slave_id = device.get("slaveId")
+        name = device.get("name", "Unknown")
+        filepath = get_device_filepath(slave_id, name)
+        for reading in device.get("readings", []):
+            loop.run_in_executor(
+                executor,
+                _write_data_row_sync,
+                filepath, slave_id, name, timestamp,
+                reading.get("label"), reading.get("value"),
+            )
+
+
+async def log_config_message(payload: dict, event: str = "config") -> None:
+    loop = asyncio.get_event_loop()
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    baud_rate = payload.get("baudRate")
+    interval = payload.get("interval")
+    for device in payload.get("devices", []):
+        slave_id = device.get("slaveId")
+        name = device.get("name", "Unknown")
+        filepath = get_device_filepath(slave_id, name)
+        loop.run_in_executor(
+            executor,
+            _write_config_row_sync,
+            filepath, timestamp, event, baud_rate, interval, device,
+        )
+
+
+def parse_request(path: str) -> tuple[str, str | None]:
     parsed = urlparse(path)
     params = parse_qs(parsed.query)
     role = params.get("role", [None])[0]
@@ -56,6 +155,15 @@ async def handle_connection(ws):
                 if client_ws is not None:
                     await client_ws.send(message)
                     print(f"[relay -> client] {message}")
+                try:
+                    payload = json.loads(message)
+                    msg_type = payload.get("type")
+                    if msg_type == "data":
+                        await log_data_message(payload)
+                    elif msg_type == "config":
+                        await log_config_message(payload)
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    print(f"[logger] Skipping malformed message: {exc}")
         except websockets.ConnectionClosed:
             pass
         finally:
@@ -105,6 +213,7 @@ async def stdin_loop():
 
 
 async def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     async with websockets.serve(
         handle_connection,
         "0.0.0.0",

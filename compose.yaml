@@ -7,3 +7,5 @@ services:
       - PORT=8080
     restart: unless-stopped
     stdin_open: true
+    volumes:
+      - ./output:/app/output
