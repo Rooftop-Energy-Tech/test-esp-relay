@@ -151,27 +151,21 @@ async def handle_connection(ws):
             return
         gateway_ws = ws
         print("[relay] Gateway connected")
-        buffer = ""
         try:
             async for message in ws:
-                chunk = message if isinstance(message, str) else message.decode()
-                print(f"[relay] chunk ({len(chunk)}B): {repr(chunk[:80])}")
-                buffer += chunk
-                print(f"[relay] buffer ({len(buffer)}B): {repr(buffer[:80])}")
+                print(f"[gateway -> relay] {message}")
+                if client_ws is not None:
+                    await client_ws.send(message)
+                    print(f"[relay -> client] {message}")
                 try:
-                    payload = json.loads(buffer)
-                    print(f"[gateway -> relay] {buffer}")
-                    if client_ws is not None:
-                        await client_ws.send(buffer)
-                        print(f"[relay -> client] {buffer}")
+                    payload = json.loads(message)
                     msg_type = payload.get("type")
                     if msg_type == "data":
                         await log_data_message(payload)
                     elif msg_type == "config":
                         await log_config_message(payload)
-                    buffer = ""
-                except json.JSONDecodeError as exc:
-                    print(f"[relay] incomplete ({exc}), buffering...")
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    print(f"[logger] Skipping malformed message: {exc}")
         except websockets.ConnectionClosed:
             pass
         finally:
