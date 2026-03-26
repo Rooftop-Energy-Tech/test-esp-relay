@@ -10,13 +10,15 @@ from http import HTTPStatus
 from urllib.parse import parse_qs, urlparse
 
 import websockets
+import websockets.asyncio.server
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 PORT = int(os.environ.get("PORT", 8080))
 OUTPUT_DIR = "./output"
 
-gateway_ws = None
-client_ws = None
+gateway_ws: websockets.asyncio.server.ServerConnection | None = None
+client_ws: websockets.asyncio.server.ServerConnection | None = None
 
 executor = ThreadPoolExecutor(max_workers=4)
 _file_locks: dict[str, threading.Lock] = {}
@@ -45,10 +47,10 @@ def _ensure_workbook(filepath: str) -> Workbook:
     if os.path.exists(filepath):
         return load_workbook(filepath)
     wb = Workbook()
-    ws_config = wb.active
+    ws_config: Worksheet = wb.active  # type: ignore[assignment]
     ws_config.title = "Config"
     ws_config.append(CONFIG_HEADERS)
-    ws_data = wb.create_sheet("Data")
+    ws_data: Worksheet = wb.create_sheet("Data")
     ws_data.append(DATA_HEADERS)
     return wb
 
@@ -61,7 +63,7 @@ def _write_data_row_sync(filepath: str, slave_id: int, name: str, timestamp: str
         wb.save(filepath)
 
 
-def _write_config_row_sync(filepath: str, timestamp: str, event: str, baud_rate: int, interval: int, device: dict) -> None:
+def _write_config_row_sync(filepath: str, timestamp: str, event: str, baud_rate: int | None, interval: int | None, device: dict) -> None:
     lock = _get_file_lock(filepath)
     with lock:
         wb = _ensure_workbook(filepath)
@@ -219,6 +221,7 @@ async def main():
         "0.0.0.0",
         PORT,
         process_request=process_request,
+        max_size=200 * 1024 * 1024,
     ):
         print(f"Listening on 0.0.0.0:{PORT}")
         await stdin_loop()
