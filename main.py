@@ -155,22 +155,23 @@ async def handle_connection(ws):
         try:
             async for message in ws:
                 chunk = message if isinstance(message, str) else message.decode()
+                print(f"[relay] chunk ({len(chunk)}B): {repr(chunk[:80])}")
                 buffer += chunk
-                while buffer:
-                    try:
-                        payload = json.loads(buffer)
-                        print(f"[gateway -> relay] {buffer}")
-                        if client_ws is not None:
-                            await client_ws.send(buffer)
-                            print(f"[relay -> client] {buffer}")
-                        msg_type = payload.get("type")
-                        if msg_type == "data":
-                            await log_data_message(payload)
-                        elif msg_type == "config":
-                            await log_config_message(payload)
-                        buffer = ""
-                    except json.JSONDecodeError:
-                        break
+                print(f"[relay] buffer ({len(buffer)}B): {repr(buffer[:80])}")
+                try:
+                    payload = json.loads(buffer)
+                    print(f"[gateway -> relay] {buffer}")
+                    if client_ws is not None:
+                        await client_ws.send(buffer)
+                        print(f"[relay -> client] {buffer}")
+                    msg_type = payload.get("type")
+                    if msg_type == "data":
+                        await log_data_message(payload)
+                    elif msg_type == "config":
+                        await log_config_message(payload)
+                    buffer = ""
+                except json.JSONDecodeError as exc:
+                    print(f"[relay] incomplete ({exc}), buffering...")
         except websockets.ConnectionClosed:
             pass
         finally:
